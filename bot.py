@@ -24,14 +24,21 @@ SHEET_NAME  = os.environ.get("SHEET_NAME", "Data Pelanggan")
 CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
 # ============================================================
+# KOLOM DI GOOGLE SHEET (1-based index)
+# ============================================================
+COL_CHAT_ID       = 12  # L - Chat ID user (otomatis)
+COL_NOMOR_ORDER   = 13  # M - Nomor Order (diisi admin)
+COL_STATUS        = 14  # N - Status (diisi admin)
+COL_NOTIF_TERKIRIM = 15 # O - Notif Terkirim (otomatis)
+
+# ============================================================
 # LOGGING
 # ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# TEMPLATE & FIELD KEYS
-# Untuk tambah field baru: tambahkan di TEMPLATE dan FIELDS
+# TEMPLATE FORM
 # ============================================================
 TEMPLATE = """📋 *FORM DATA PELANGGAN*
 
@@ -51,7 +58,6 @@ Alamat Pemasangan :
 
 ⚠️ Jangan ubah nama field-nya ya, hanya isi bagian setelah tanda titik dua ( : )"""
 
-# Field keys harus cocok dengan label di template (lowercase)
 FIELDS = [
     "nama usaha",
     "nama pic",
@@ -66,7 +72,6 @@ FIELDS = [
 
 OPTIONAL_FIELDS = ["no hp alternatif"]
 
-# State ConversationHandler
 WAITING_INPUT = 1
 
 # ============================================================
@@ -89,7 +94,8 @@ def get_sheet():
         headers = [
             "Tanggal Input", "Yang Input", "Nama Usaha", "Nama PIC",
             "NIK KTP", "Tempat/Tgl Lahir PIC", "No HP Aktif",
-            "No HP Alternatif", "Email", "Paket Berlangganan", "Alamat Pemasangan"
+            "No HP Alternatif", "Email", "Paket Berlangganan", "Alamat Pemasangan",
+            "Chat ID", "Nomor Order", "Status", "Notif Terkirim"
         ]
         sheet.append_row(headers)
 
@@ -114,7 +120,6 @@ def parse_input(text: str):
                 data[field] = value if value else "-"
                 break
 
-    # Validasi field wajib
     missing = []
     for field in FIELDS:
         if field in OPTIONAL_FIELDS:
@@ -122,7 +127,6 @@ def parse_input(text: str):
         if field not in data or data[field] in ("", "-", "(isi strip jika tidak ada)"):
             missing.append(field.title())
 
-    # Field opsional default ke "-" jika tidak ada
     for field in OPTIONAL_FIELDS:
         if field not in data:
             data[field] = "-"
@@ -148,6 +152,7 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"@{from_user.username}" if from_user.username
         else f"{from_user.first_name or ''} {from_user.last_name or ''}".strip()
     )
+    context.user_data["chat_id"] = update.effective_chat.id
 
     await update.message.reply_text(TEMPLATE, parse_mode="Markdown")
     return WAITING_INPUT
@@ -163,6 +168,7 @@ async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text     = update.message.text
     input_by = context.user_data.get("input_by", "Unknown")
+    chat_id  = context.user_data.get("chat_id", "")
 
     data, missing = parse_input(text)
 
@@ -176,13 +182,13 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_INPUT
 
-    await save_to_sheet(update, context, data, input_by)
+    await save_to_sheet(update, context, data, input_by, chat_id)
     return ConversationHandler.END
 
 # ============================================================
 # SIMPAN KE GOOGLE SHEET
 # ============================================================
-async def save_to_sheet(update, context, data, input_by):
+async def save_to_sheet(update, context, data, input_by, chat_id):
     try:
         tz  = pytz.timezone("Asia/Jakarta")
         now = datetime.now(tz).strftime("%d/%m/%Y %H:%M:%S")
@@ -200,6 +206,10 @@ async def save_to_sheet(update, context, data, input_by):
             data.get("email", ""),
             data.get("paket berlangganan", ""),
             data.get("alamat pemasangan", ""),
+            str(chat_id),  # Kolom L - Chat ID
+            "",            # Kolom M - Nomor Order (diisi admin)
+            "",            # Kolom N - Status (diisi admin)
+            "",            # Kolom O - Notif Terkirim (otomatis)
         ]
         sheet.append_row(row)
 
@@ -216,7 +226,7 @@ async def save_to_sheet(update, context, data, input_by):
             f"📍 Alamat          : {data.get('alamat pemasangan')}\n"
             f"🕐 Waktu Input     : {now}\n"
             f"👤 Diinput oleh    : {input_by}\n\n"
-            f"Ketik /daftar untuk input data pelanggan baru."
+            f"⏳ Nomor order akan dikirim ke sini setelah diproses admin."
         )
         await update.message.reply_text(summary, parse_mode="Markdown")
 
@@ -225,6 +235,57 @@ async def save_to_sheet(update, context, data, input_by):
         await update.message.reply_text("⚠️ Terjadi kesalahan saat menyimpan data. Hubungi admin.")
 
     context.user_data.clear()
+
+# ============================================================
+# CEK NOMOR ORDER & KIRIM NOTIFIKASI (dijalankan setiap 15 menit)
+# ============================================================
+async def cek_nomor_order(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        sheet = get_sheet()
+        rows  = sheet.get_all_values()
+
+        if len(rows) <= 1:
+            return  # Hanya header, tidak ada data
+
+        for i, row in enumerate(rows[1:], start=2):  # Mulai dari baris 2
+            # Pastikan baris cukup panjang
+            while len(row) < COL_NOTIF_TERKIRIM:
+                row.append("")
+
+            chat_id        = row[COL_CHAT_ID - 1].strip()
+            nomor_order    = row[COL_NOMOR_ORDER - 1].strip()
+            status         = row[COL_STATUS - 1].strip()
+            notif_terkirim = row[COL_NOTIF_TERKIRIM - 1].strip()
+
+            # Kirim notif jika: ada chat_id, ada nomor order, belum pernah dikirim
+            if chat_id and nomor_order and not notif_terkirim:
+                nama_usaha = row[2] if len(row) > 2 else "-"
+                nama_pic   = row[3] if len(row) > 3 else "-"
+
+                pesan = (
+                    f"🎉 *Nomor Order Tersedia!*\n\n"
+                    f"🏢 Nama Usaha  : {nama_usaha}\n"
+                    f"👤 Nama PIC    : {nama_pic}\n"
+                    f"📋 Nomor Order : *{nomor_order}*\n"
+                    f"📌 Status      : {status if status else '-'}\n\n"
+                    f"Silakan simpan nomor order ini untuk keperluan tracking."
+                )
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(chat_id),
+                        text=pesan,
+                        parse_mode="Markdown"
+                    )
+                    # Tandai notif sudah terkirim
+                    sheet.update_cell(i, COL_NOTIF_TERKIRIM, "✅ Terkirim")
+                    logger.info(f"Notif terkirim ke chat_id {chat_id} untuk order {nomor_order}")
+
+                except Exception as e:
+                    logger.error(f"Gagal kirim notif ke {chat_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error cek_nomor_order: {e}")
 
 # ============================================================
 # PESAN DI LUAR KONTEKS
@@ -254,6 +315,13 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
+
+    # Job setiap 15 menit untuk cek nomor order baru
+    app.job_queue.run_repeating(
+        cek_nomor_order,
+        interval=900,  # 900 detik = 15 menit
+        first=60,      # Mulai cek pertama setelah 60 detik bot nyala
+    )
 
     logger.info("Bot berjalan...")
     app.run_polling()
