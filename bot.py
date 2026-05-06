@@ -21,13 +21,53 @@ from google.oauth2.service_account import Credentials
 BOT_TOKEN   = os.environ.get("BOT_TOKEN")
 SHEET_ID    = os.environ.get("SHEET_ID")
 SHEET_NAME  = os.environ.get("SHEET_NAME", "Data Pelanggan")
-CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")  # isi dengan isi file JSON (string)
+CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
 # ============================================================
 # LOGGING
 # ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# TEMPLATE & FIELD KEYS
+# Untuk tambah field baru: tambahkan di TEMPLATE dan FIELDS
+# ============================================================
+TEMPLATE = """📋 *FORM DATA PELANGGAN*
+
+Silakan copy teks di bawah ini, isi datanya, lalu kirim balik ke sini:
+
+```
+Nama Usaha        : 
+Nama PIC          : 
+NIK KTP           : 
+Tempat/Tgl Lahir  : 
+No HP Aktif       : 
+No HP Alternatif  : (isi strip jika tidak ada)
+Email             : 
+Paket Berlangganan: 
+Alamat Pemasangan : 
+```
+
+⚠️ Jangan ubah nama field-nya ya, hanya isi bagian setelah tanda titik dua ( : )"""
+
+# Field keys harus cocok dengan label di template (lowercase)
+FIELDS = [
+    "nama usaha",
+    "nama pic",
+    "nik ktp",
+    "tempat/tgl lahir",
+    "no hp aktif",
+    "no hp alternatif",
+    "email",
+    "paket berlangganan",
+    "alamat pemasangan",
+]
+
+OPTIONAL_FIELDS = ["no hp alternatif"]
+
+# State ConversationHandler
+WAITING_INPUT = 1
 
 # ============================================================
 # KONEKSI KE GOOGLE SHEET
@@ -56,23 +96,38 @@ def get_sheet():
     return sheet
 
 # ============================================================
-# URUTAN PERTANYAAN
-# Untuk tambah field baru: tambahkan dict baru di list ini
+# PARSE TEMPLATE YANG DIISI USER
 # ============================================================
-QUESTIONS = [
-    {"key": "nama_usaha",        "label": "Nama Usaha",                                          "optional": False},
-    {"key": "nama_pic",          "label": "Nama PIC",                                            "optional": False},
-    {"key": "nik_ktp",           "label": "NIK KTP",                                             "optional": False},
-    {"key": "ttl_pic",           "label": "Tempat/Tanggal Lahir PIC\n(contoh: Jakarta, 01 Januari 1990)", "optional": False},
-    {"key": "no_hp",             "label": "No HP Aktif",                                         "optional": False},
-    {"key": "no_hp_alt",         "label": "No HP Alternatif\n(ketik 'skip' jika tidak ada)",     "optional": True},
-    {"key": "email",             "label": "Email",                                               "optional": False},
-    {"key": "paket",             "label": "Paket Berlangganan",                                  "optional": False},
-    {"key": "alamat_pemasangan", "label": "Alamat Pemasangan",                                   "optional": False},
-]
+def parse_input(text: str):
+    data = {}
+    lines = text.strip().splitlines()
 
-# State untuk ConversationHandler
-ANSWERING = 1
+    for line in lines:
+        if ":" not in line:
+            continue
+        parts = line.split(":", 1)
+        key   = parts[0].strip().lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+
+        for field in FIELDS:
+            if field in key:
+                data[field] = value if value else "-"
+                break
+
+    # Validasi field wajib
+    missing = []
+    for field in FIELDS:
+        if field in OPTIONAL_FIELDS:
+            continue
+        if field not in data or data[field] in ("", "-", "(isi strip jika tidak ada)"):
+            missing.append(field.title())
+
+    # Field opsional default ke "-" jika tidak ada
+    for field in OPTIONAL_FIELDS:
+        if field not in data:
+            data[field] = "-"
+
+    return data, missing
 
 # ============================================================
 # COMMAND HANDLERS
@@ -88,18 +143,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["step"] = 0
-    context.user_data["data"] = {}
-
     from_user = update.effective_user
     context.user_data["input_by"] = (
         f"@{from_user.username}" if from_user.username
         else f"{from_user.first_name or ''} {from_user.last_name or ''}".strip()
     )
 
-    await ask_question(update, context)
-    return ANSWERING
+    await update.message.reply_text(TEMPLATE, parse_mode="Markdown")
+    return WAITING_INPUT
 
 async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -107,48 +158,31 @@ async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ============================================================
-# LOGIKA PERTANYAAN & JAWABAN
+# PROSES INPUT DARI USER
 # ============================================================
-async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data["step"]
-    q = QUESTIONS[step]
-    total = len(QUESTIONS)
-    optional_note = "" if q["optional"] else " _(wajib diisi)_"
-    await update.message.reply_text(
-        f"📝 *[{step + 1}/{total}]* {q['label']}{optional_note}",
-        parse_mode="Markdown"
-    )
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text     = update.message.text
+    input_by = context.user_data.get("input_by", "Unknown")
 
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data["step"]
-    q = QUESTIONS[step]
-    text = update.message.text.strip()
+    data, missing = parse_input(text)
 
-    if text.lower() == "skip":
-        if q["optional"]:
-            context.user_data["data"][q["key"]] = "-"
-        else:
-            await update.message.reply_text("⚠️ Field ini wajib diisi, tidak bisa dilewati.")
-            return ANSWERING
-    else:
-        context.user_data["data"][q["key"]] = text
+    if missing:
+        await update.message.reply_text(
+            f"⚠️ Data tidak lengkap atau format salah!\n\n"
+            f"Field yang belum terisi:\n" +
+            "\n".join([f"• {m}" for m in missing]) +
+            f"\n\nSilakan kirim ulang dengan format template yang benar.",
+            parse_mode="Markdown"
+        )
+        return WAITING_INPUT
 
-    context.user_data["step"] += 1
-
-    if context.user_data["step"] < len(QUESTIONS):
-        await ask_question(update, context)
-        return ANSWERING
-    else:
-        await save_to_sheet(update, context)
-        return ConversationHandler.END
+    await save_to_sheet(update, context, data, input_by)
+    return ConversationHandler.END
 
 # ============================================================
 # SIMPAN KE GOOGLE SHEET
 # ============================================================
-async def save_to_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data     = context.user_data["data"]
-    input_by = context.user_data["input_by"]
-
+async def save_to_sheet(update, context, data, input_by):
     try:
         tz  = pytz.timezone("Asia/Jakarta")
         now = datetime.now(tz).strftime("%d/%m/%Y %H:%M:%S")
@@ -157,29 +191,29 @@ async def save_to_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = [
             now,
             input_by,
-            data.get("nama_usaha", ""),
-            data.get("nama_pic", ""),
-            data.get("nik_ktp", ""),
-            data.get("ttl_pic", ""),
-            data.get("no_hp", ""),
-            data.get("no_hp_alt", ""),
+            data.get("nama usaha", ""),
+            data.get("nama pic", ""),
+            data.get("nik ktp", ""),
+            data.get("tempat/tgl lahir", ""),
+            data.get("no hp aktif", ""),
+            data.get("no hp alternatif", ""),
             data.get("email", ""),
-            data.get("paket", ""),
-            data.get("alamat_pemasangan", ""),
+            data.get("paket berlangganan", ""),
+            data.get("alamat pemasangan", ""),
         ]
         sheet.append_row(row)
 
         summary = (
             f"✅ *Data berhasil disimpan!*\n\n"
-            f"🏢 Nama Usaha      : {data.get('nama_usaha')}\n"
-            f"👤 Nama PIC        : {data.get('nama_pic')}\n"
-            f"🪪 NIK KTP         : {data.get('nik_ktp')}\n"
-            f"🎂 Tempat/Tgl Lahir: {data.get('ttl_pic')}\n"
-            f"📱 No HP Aktif     : {data.get('no_hp')}\n"
-            f"📱 No HP Alt       : {data.get('no_hp_alt')}\n"
+            f"🏢 Nama Usaha      : {data.get('nama usaha')}\n"
+            f"👤 Nama PIC        : {data.get('nama pic')}\n"
+            f"🪪 NIK KTP         : {data.get('nik ktp')}\n"
+            f"🎂 Tempat/Tgl Lahir: {data.get('tempat/tgl lahir')}\n"
+            f"📱 No HP Aktif     : {data.get('no hp aktif')}\n"
+            f"📱 No HP Alt       : {data.get('no hp alternatif')}\n"
             f"📧 Email           : {data.get('email')}\n"
-            f"📦 Paket           : {data.get('paket')}\n"
-            f"📍 Alamat          : {data.get('alamat_pemasangan')}\n"
+            f"📦 Paket           : {data.get('paket berlangganan')}\n"
+            f"📍 Alamat          : {data.get('alamat pemasangan')}\n"
             f"🕐 Waktu Input     : {now}\n"
             f"👤 Diinput oleh    : {input_by}\n\n"
             f"Ketik /daftar untuk input data pelanggan baru."
@@ -209,8 +243,8 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("daftar", daftar)],
         states={
-            ANSWERING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer),
+            WAITING_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input),
                 CommandHandler("batal", batal),
             ],
         },
