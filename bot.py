@@ -232,7 +232,10 @@ async def save_to_sheet(update, context, data, input_by, chat_id):
 
     except Exception as e:
         logger.error(f"Error save_to_sheet: {e}")
-        await update.message.reply_text("⚠️ Terjadi kesalahan saat menyimpan data. Hubungi admin.")
+        logger.error(f"Raw message: {update.message.text}")
+        import traceback
+            logger.error(traceback.format_exc())  # ini yang penting, kasih tau baris exac yang error
+            await update.message.reply_text("⚠️ Terjadi kesalahan saat menyimpan data. Hubungi admin.")
 
     context.user_data.clear()
 
