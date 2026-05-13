@@ -3,11 +3,12 @@ import json
 import logging
 from datetime import datetime
 import pytz
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
     ConversationHandler,
@@ -25,11 +26,15 @@ CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 
 # ============================================================
 # KOLOM DI GOOGLE SHEET (1-based index)
+# Urutan: Tanggal | Yang Input | Nama Usaha | Nama PIC | NIK KTP |
+#         Tempat/Tgl Lahir | No HP Aktif | No HP Alt | Email |
+#         Speed Layanan | Harga Paket | Alamat Pemasangan |
+#         Chat ID | Nomor Order | Status | Notif Terkirim
 # ============================================================
-COL_CHAT_ID       = 12  # L - Chat ID user (otomatis)
-COL_NOMOR_ORDER   = 13  # M - Nomor Order (diisi admin)
-COL_STATUS        = 14  # N - Status (diisi admin)
-COL_NOTIF_TERKIRIM = 15 # O - Notif Terkirim (otomatis)
+COL_CHAT_ID        = 13  # M - Chat ID user (otomatis)
+COL_NOMOR_ORDER    = 14  # N - Nomor Order (diisi admin)
+COL_STATUS         = 15  # O - Status (diisi admin)
+COL_NOTIF_TERKIRIM = 16  # P - Notif Terkirim (otomatis)
 
 # ============================================================
 # LOGGING
@@ -38,7 +43,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# TEMPLATE FORM
+# PILIHAN SPEED LAYANAN
+# ============================================================
+SPEED_OPTIONS = ["50", "75", "100", "150", "200", "300"]
+
+# ============================================================
+# TEMPLATE FORM (tanpa Speed Layanan & Harga Paket — diisi via bot)
 # ============================================================
 TEMPLATE = """📋 *FORM DATA PELANGGAN*
 
@@ -52,11 +62,12 @@ Tempat/Tgl Lahir  :
 No HP Aktif       : 
 No HP Alternatif  : (isi strip jika tidak ada)
 Email             : 
-Paket Berlangganan: 
 Alamat Pemasangan : 
 ```
 
-⚠️ Jangan ubah nama field-nya ya, hanya isi bagian setelah tanda titik dua ( : )"""
+⚠️ Jangan ubah nama field-nya ya, hanya isi bagian setelah tanda titik dua ( : )
+
+Setelah kirim form ini, kamu akan diminta memilih *Speed Layanan* dan mengisi *Harga Paket*."""
 
 FIELDS = [
     "nama usaha",
@@ -66,13 +77,17 @@ FIELDS = [
     "no hp aktif",
     "no hp alternatif",
     "email",
-    "paket berlangganan",
     "alamat pemasangan",
 ]
 
 OPTIONAL_FIELDS = ["no hp alternatif"]
 
-WAITING_INPUT = 1
+# ============================================================
+# STATE CONVERSATION
+# ============================================================
+WAITING_INPUT  = 1
+WAITING_SPEED  = 2
+WAITING_HARGA  = 3
 
 # ============================================================
 # KONEKSI KE GOOGLE SHEET
@@ -94,8 +109,8 @@ def get_sheet():
         headers = [
             "Tanggal Input", "Yang Input", "Nama Usaha", "Nama PIC",
             "NIK KTP", "Tempat/Tgl Lahir PIC", "No HP Aktif",
-            "No HP Alternatif", "Email", "Paket Berlangganan", "Alamat Pemasangan",
-            "Chat ID", "Nomor Order", "Status", "Notif Terkirim"
+            "No HP Alternatif", "Email", "Speed Layanan", "Harga Paket",
+            "Alamat Pemasangan", "Chat ID", "Nomor Order", "Status", "Notif Terkirim"
         ]
         sheet.append_row(headers)
 
@@ -163,13 +178,10 @@ async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ============================================================
-# PROSES INPUT DARI USER
+# STEP 1 — TERIMA FORM TEKS DARI USER
 # ============================================================
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text     = update.message.text
-    input_by = context.user_data.get("input_by", "Unknown")
-    chat_id  = context.user_data.get("chat_id", "")
-
+    text = update.message.text
     data, missing = parse_input(text)
 
     if missing:
@@ -181,6 +193,73 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return WAITING_INPUT
+
+    # Simpan data sementara
+    context.user_data["form_data"] = data
+
+    # Tampilkan inline button pilihan speed
+    keyboard = [
+        [
+            InlineKeyboardButton("🚀 50 Mbps",  callback_data="speed_50"),
+            InlineKeyboardButton("🚀 75 Mbps",  callback_data="speed_75"),
+            InlineKeyboardButton("🚀 100 Mbps", callback_data="speed_100"),
+        ],
+        [
+            InlineKeyboardButton("⚡ 150 Mbps", callback_data="speed_150"),
+            InlineKeyboardButton("⚡ 200 Mbps", callback_data="speed_200"),
+            InlineKeyboardButton("⚡ 300 Mbps", callback_data="speed_300"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "✅ Form diterima!\n\n"
+        "📶 Pilih *Speed Layanan* yang sesuai:",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    return WAITING_SPEED
+
+# ============================================================
+# STEP 2 — TERIMA PILIHAN SPEED LEWAT BUTTON
+# ============================================================
+async def handle_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    speed = query.data.replace("speed_", "")
+    context.user_data["form_data"]["speed layanan"] = f"{speed} Mbps"
+
+    # Edit pesan button supaya tidak bisa dipilih ulang
+    await query.edit_message_text(
+        f"✅ Form diterima!\n\n"
+        f"📶 Speed Layanan: *{speed} Mbps* dipilih.\n\n"
+        f"💰 Sekarang masukkan *Harga Paket* (angka saja, contoh: 150000):",
+        parse_mode="Markdown"
+    )
+    return WAITING_HARGA
+
+# ============================================================
+# STEP 3 — TERIMA HARGA PAKET (WAJIB ANGKA)
+# ============================================================
+async def handle_harga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(".", "").replace(",", "")
+
+    if not text.isdigit():
+        await update.message.reply_text(
+            "⚠️ Harga paket harus berupa *angka* saja!\n\n"
+            "Contoh yang benar: `150000`\n"
+            "Silakan coba lagi.",
+            parse_mode="Markdown"
+        )
+        return WAITING_HARGA
+
+    harga = int(text)
+    context.user_data["form_data"]["harga paket"] = harga
+
+    input_by = context.user_data.get("input_by", "Unknown")
+    chat_id  = context.user_data.get("chat_id", "")
+    data     = context.user_data["form_data"]
 
     await save_to_sheet(update, context, data, input_by, chat_id)
     return ConversationHandler.END
@@ -194,6 +273,11 @@ async def save_to_sheet(update, context, data, input_by, chat_id):
         now = datetime.now(tz).strftime("%d/%m/%Y %H:%M:%S")
 
         sheet = get_sheet()
+
+        # Format harga ke Rupiah untuk ditampilkan di summary
+        harga_raw = data.get("harga paket", 0)
+        harga_fmt = f"Rp {int(harga_raw):,}".replace(",", ".")
+
         row = [
             now,
             input_by,
@@ -204,17 +288,18 @@ async def save_to_sheet(update, context, data, input_by, chat_id):
             data.get("no hp aktif", ""),
             data.get("no hp alternatif", ""),
             data.get("email", ""),
-            data.get("paket berlangganan", ""),
+            data.get("speed layanan", ""),   # Kolom J - Speed Layanan
+            int(harga_raw),                  # Kolom K - Harga Paket (angka)
             data.get("alamat pemasangan", ""),
-            str(chat_id),  # Kolom L - Chat ID
-            "",            # Kolom M - Nomor Order (diisi admin)
-            "",            # Kolom N - Status (diisi admin)
-            "",            # Kolom O - Notif Terkirim (otomatis)
+            str(chat_id),                    # Kolom M - Chat ID
+            "",                              # Kolom N - Nomor Order (diisi admin)
+            "",                              # Kolom O - Status (diisi admin)
+            "",                              # Kolom P - Notif Terkirim (otomatis)
         ]
         sheet.append_row(row)
 
         summary = (
-            f"✅ *Data berhasil disimpan!*\n\n"
+            f"🎉 *Data berhasil disimpan!*\n\n"
             f"🏢 Nama Usaha      : {data.get('nama usaha')}\n"
             f"👤 Nama PIC        : {data.get('nama pic')}\n"
             f"🪪 NIK KTP         : {data.get('nik ktp')}\n"
@@ -222,7 +307,8 @@ async def save_to_sheet(update, context, data, input_by, chat_id):
             f"📱 No HP Aktif     : {data.get('no hp aktif')}\n"
             f"📱 No HP Alt       : {data.get('no hp alternatif')}\n"
             f"📧 Email           : {data.get('email')}\n"
-            f"📦 Paket           : {data.get('paket berlangganan')}\n"
+            f"📶 Speed Layanan   : {data.get('speed layanan')}\n"
+            f"💰 Harga Paket     : {harga_fmt}\n"
             f"📍 Alamat          : {data.get('alamat pemasangan')}\n"
             f"🕐 Waktu Input     : {now}\n"
             f"👤 Diinput oleh    : {input_by}\n\n"
@@ -232,10 +318,7 @@ async def save_to_sheet(update, context, data, input_by, chat_id):
 
     except Exception as e:
         logger.error(f"Error save_to_sheet: {e}")
-        logger.error(f"Raw message: {update.message.text}")
-        import traceback
-            logger.error(traceback.format_exc())  # ini yang penting, kasih tau baris exac yang error
-            await update.message.reply_text("⚠️ Terjadi kesalahan saat menyimpan data. Hubungi admin.")
+        await update.message.reply_text("⚠️ Terjadi kesalahan saat menyimpan data. Hubungi admin.")
 
     context.user_data.clear()
 
@@ -250,8 +333,7 @@ async def cek_nomor_order(context: ContextTypes.DEFAULT_TYPE):
         if len(rows) <= 1:
             return  # Hanya header, tidak ada data
 
-        for i, row in enumerate(rows[1:], start=2):  # Mulai dari baris 2
-            # Pastikan baris cukup panjang
+        for i, row in enumerate(rows[1:], start=2):
             while len(row) < COL_NOTIF_TERKIRIM:
                 row.append("")
 
@@ -260,7 +342,6 @@ async def cek_nomor_order(context: ContextTypes.DEFAULT_TYPE):
             status         = row[COL_STATUS - 1].strip()
             notif_terkirim = row[COL_NOTIF_TERKIRIM - 1].strip()
 
-            # Kirim notif jika: ada chat_id, ada nomor order, belum pernah dikirim
             if chat_id and nomor_order and not notif_terkirim:
                 nama_usaha = row[2] if len(row) > 2 else "-"
                 nama_pic   = row[3] if len(row) > 3 else "-"
@@ -280,7 +361,6 @@ async def cek_nomor_order(context: ContextTypes.DEFAULT_TYPE):
                         text=pesan,
                         parse_mode="Markdown"
                     )
-                    # Tandai notif sudah terkirim
                     sheet.update_cell(i, COL_NOTIF_TERKIRIM, "✅ Terkirim")
                     logger.info(f"Notif terkirim ke chat_id {chat_id} untuk order {nomor_order}")
 
@@ -311,6 +391,14 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input),
                 CommandHandler("batal", batal),
             ],
+            WAITING_SPEED: [
+                CallbackQueryHandler(handle_speed, pattern="^speed_"),
+                CommandHandler("batal", batal),
+            ],
+            WAITING_HARGA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_harga),
+                CommandHandler("batal", batal),
+            ],
         },
         fallbacks=[CommandHandler("batal", batal)],
     )
@@ -322,8 +410,8 @@ def main():
     # Job setiap 15 menit untuk cek nomor order baru
     app.job_queue.run_repeating(
         cek_nomor_order,
-        interval=900,  # 900 detik = 15 menit
-        first=60,      # Mulai cek pertama setelah 60 detik bot nyala
+        interval=900,   # 900 detik = 15 menit
+        first=60,       # Mulai cek pertama setelah 60 detik bot nyala
     )
 
     logger.info("Bot berjalan...")
